@@ -1,134 +1,118 @@
 # Demo Builder
 
-Record your screen and webcam in the browser, review the take, then share it
-with a link. Optional Dropbox mirroring for the recordings you want off-machine.
+Record your screen and webcam in the browser, review the take, and hand someone
+a link to the product you are building — one click, no export step.
 
-Everything runs locally: recordings are captured with `MediaRecorder`, uploaded
-to a local Express server, and streamed back with HTTP range requests. The
-webcam background blur/replacement runs on-device with MediaPipe, and the noise
-suppressor is a hand-rolled AudioWorklet. Nothing is sent anywhere unless you
-configure Dropbox.
+![Demo Builder recorder](readme_image_1.png)
+
+## System design
+
+The browser does the media work; the server is a thin store-and-stream tier.
+
+```
+getDisplayMedia + getUserMedia
+  -> canvas composite (screen + webcam bubble, MediaPipe segmentation)
+  -> Web Audio mic chain (mixed with system audio)
+  -> MediaRecorder -> single WebM blob
+  -> XHR multipart upload -> Express 5 + multer -> file on disk
+                                                -> metadata row in Postgres
+  -> playback via HTTP range requests
+  -> optional mirror to Dropbox -> shared link
+```
+
+Capture is client-side by design: compositing, segmentation and audio processing
+all run on-device, so the server never transcodes and scales with disk and
+bandwidth rather than CPU. The recording canvas is driven by a clock ticked from
+the audio thread rather than `requestAnimationFrame`, which stops firing the
+moment the user leaves the tab — the normal case for screen recording.
+
+Contracts are generated, not hand-written: `lib/api-spec/openapi.yaml` is the
+source of truth and orval emits the Zod schemas and react-query hooks from it.
+Anything under `src/generated/` is output — change the spec and re-run codegen.
+
+```
+artifacts/web         React + Vite + Tailwind frontend
+artifacts/api-server  Express API, Dropbox client, range streaming
+lib/api-spec          openapi.yaml + orval config
+lib/api-zod           generated schemas          lib/db   Drizzle schema
+lib/api-client-react  generated hooks            scripts  dropbox-setup CLI
+```
+
+pnpm workspaces, TypeScript throughout. Postgres via Drizzle.
+
+## Noise cancellation
+
+No third-party service or package — it is built directly on the Web Audio API,
+in two layers that the four profiles (Raw, Standard, Strong, Studio) tune
+together:
+
+1. **The browser's own audio processor**, via `getUserMedia` constraints:
+   `echoCancellation`, `noiseSuppression`, `autoGainControl`, plus Chromium's
+   `voiceIsolation` on Studio. Tuned for conferencing — aggressive, low latency,
+   not adjustable.
+2. **A custom AudioWorklet** (`artifacts/web/public/worklets/noise-suppressor.js`)
+   running a spectral suppressor on the audio thread: 1024-point STFT with a
+   sqrt-Hann window at 75% overlap, per-bin noise tracking with an asymmetric
+   follower, a decision-directed (Ephraim–Malah) a-priori SNR estimate feeding a
+   Wiener gain, a spectral floor and 3-tap frequency smoothing to kill musical
+   noise, and an optional broadband gate for pauses. About 18.7 ms of latency at
+   48 kHz, and bypass is COLA-exact so toggling it cannot colour the signal.
+
+The graph is `source -> highpass -> suppressor -> compressor -> makeup gain ->
+analyser`. Its shape is fixed and profile switches only retune parameters, so
+changing profiles mid-session never clicks or drops audio.
+
+Background blur and replacement use `@mediapipe/tasks-vision` for on-device
+selfie segmentation — the only third-party media dependency.
+
+## Dropbox sharing
+
+The point of the integration: finish a take and the viewer gets a working link,
+without anyone installing anything. Dropbox holds the file and serves the link;
+the app only orchestrates.
+
+There is no Dropbox SDK — the API server calls the v2 HTTP endpoints directly.
+Auth is the OAuth refresh-token grant, exchanged for a short-lived access token
+that is cached until just before it expires, so setup happens once and the token
+never goes stale. Uploads under 140 MB go in a single request; larger ones use an
+upload session in 16 MB chunks, tracking byte offsets exactly because
+`append_v2` rejects any offset that disagrees with the server.
+
+Saving a recording that is public or unlisted mirrors the file and calls
+`sharing/create_shared_link_with_settings` — that URL is the shareable link.
+Visibility is the control surface: switching a video back to private revokes the
+Dropbox link and mints a new local share token, which is what actually kills
+links you have already sent. Mirroring is one-way; Dropbox is a delivery
+surface, not a source of truth.
 
 ## Quick start
 
 Needs Node 20+, Docker (for Postgres), and pnpm.
 
 ```bash
-./dev.sh
+./dev.sh              # install, start Postgres, push schema, run both servers
+./dev.sh --setup      # setup only
 ```
 
-That installs dependencies, starts a Postgres container, pushes the schema, and
-runs the API on :8080 with the frontend on :5173. Copy `.env.example` to `.env`
-first if you want to point at your own database or enable Dropbox.
+The API runs on :8080 and the frontend on :5173, shifting up if those ports are
+taken. `dev.sh` runs its own Postgres container unless you set `DATABASE_URL` in
+`.env`, in which case it uses exactly that server and creates nothing.
 
 ```bash
-./dev.sh --setup
+pnpm dropbox:setup    # walks the OAuth flow, writes credentials to .env (mode 600)
 ```
 
-Setup only, without starting the servers.
-
-## Features
-
-- Screen capture with an optional webcam bubble, composited into one recording
-- Background blur or replacement (gradient presets or your own image)
-- Mic chain: highpass -> spectral noise suppression -> compressor -> makeup gain
-- Countdown, retake, and a review step before anything is uploaded
-- Library with search, plus a combined local + Dropbox view
-- Per-video visibility: `private`, `unlisted`, `public`
-- One-way Dropbox mirroring with shared links that track visibility
-
-## Stack
-
-pnpm workspaces, TypeScript. React + Vite, Tailwind, wouter, TanStack Query on
-the frontend. Express 5 + multer on the API. Postgres via Drizzle. The OpenAPI
-spec in `lib/api-spec/openapi.yaml` is the source of truth for API contracts;
-orval generates the react-query hooks and Zod schemas from it.
-
-```
-artifacts/web         React frontend
-artifacts/api-server  Express API, Dropbox client, video streaming
-lib/api-spec          openapi.yaml + orval config
-lib/api-zod           generated Zod schemas and types
-lib/api-client-react  generated react-query hooks
-lib/db                Drizzle schema
-scripts               dropbox-setup CLI
-```
-
-Anything under `src/generated/` is emitted by orval. Don't hand-edit it; change
-`openapi.yaml` and re-run codegen:
-
-```bash
-pnpm --filter @workspace/api-spec run codegen
-```
-
-## Commands
-
-```bash
-pnpm run typecheck
-```
-
-```bash
-pnpm run build
-```
-
-```bash
-pnpm --filter @workspace/db run push
-```
-
-```bash
-pnpm dropbox:setup
-```
-
-The Dropbox setup script walks the OAuth flow and writes the credentials into
-`.env` with mode 600. Dropbox needs `account_info.read`, `files.content.write`,
-`files.metadata.read`, `sharing.write` and `sharing.read`; enable them before
-generating credentials or every call fails with `missing_scope`.
+Enable `account_info.read`, `files.content.write`, `files.metadata.read`,
+`sharing.write` and `sharing.read` before generating credentials, or every call
+fails with `missing_scope`.
 
 ## Security note
 
-There is no login. Visibility governs _shared links_, not the API:
-`GET /videos` returns share tokens because the library needs them to build
-playback URLs, so anyone who can reach the API can enumerate every recording.
-Run it on localhost. Making this multi-user would mean adding auth and scoping
-reads to an owner.
-
-Within that boundary the link model does hold up: non-public reads require
-`?t=<shareToken>` for both metadata and the stream and 404 without it, so a bare
-`/watch/:id` URL reveals nothing. Switching a video to private mints a new
-token, which is what actually kills links you have already sent.
-
-## Notes
-
-Things that took a while to get right, kept here so they don't get re-broken:
-
-- **Don't drive the recording canvas from `requestAnimationFrame` alone.** rAF
-  stops firing when the document is hidden, and screen recording means the user
-  leaves the tab within seconds. `canvas.captureStream()` then repeats the last
-  drawn frame and you get a still image with perfect audio.
-  `lib/media/frame-clock.ts` ticks from the audio thread while hidden, because
-  background timers are clamped to 1s and would be just as unusable.
-- **Never store the browser-reported MIME type for an upload.** A MediaRecorder
-  blob is typed `video/webm;codecs=vp9,opus`, and that unquoted comma breaks the
-  multipart part header: busboy reports `text/plain`, which then gets served as
-  the stream's Content-Type and no player can decode it. `resolveVideoMime()`
-  derives the type from the filename and runs on read as well as write, so rows
-  stored before the fix heal themselves.
-- AudioWorklet modules can't contain `import` statements, and Vite's dev server
-  injects one into anything it transforms. The worklets live in `public/` and
-  are loaded by URL rather than bundled.
-- `applyConstraints` replaces the whole constraint set, so `voiceIsolation` is
-  folded into `micConstraintsFor()` instead of being applied as a second call.
-- MediaPipe's mask polarity for single-label selfie models is undocumented, so
-  `BackgroundProcessor` auto-detects it with a centre-vs-border vote over the
-  first frames. Guessing wrong cuts out the person instead of the background.
-- Uploads over 140 MB use a Dropbox upload session. `append_v2` rejects any
-  offset that disagrees with what the server holds, so the chunk loop has to
-  track byte offsets exactly.
-- `Dropbox-API-Arg` is an HTTP header and must be ASCII, so non-ASCII filename
-  characters are `\uXXXX`-escaped before sending.
-- Upload uses raw XHR rather than a generated hook, to get progress events on
-  large files. `/api/videos/:id/stream` is likewise not in codegen; the player
-  builds that URL directly.
+There is no login. Visibility governs shared links, not the API: `GET /videos`
+returns share tokens, so anyone who can reach the API can enumerate every
+recording. Run it on localhost. Within that boundary the link model holds —
+non-public reads require `?t=<shareToken>` for both metadata and the stream and
+404 without it. Multi-user would mean adding auth and scoping reads to an owner.
 
 ## License
 
