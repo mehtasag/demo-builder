@@ -1,0 +1,384 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: Screen recorder API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: videos
+    description: Video recording operations
+  - name: dropbox
+    description: Dropbox mirroring operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /videos:
+    get:
+      operationId: listVideos
+      tags: [videos]
+      summary: List all recordings
+      responses:
+        "200":
+          description: List of videos
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Video"
+
+    post:
+      operationId: uploadVideo
+      tags: [videos]
+      summary: Upload a new recording
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/VideoUpload"
+      responses:
+        "201":
+          description: Video created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Video"
+        "400":
+          description: Bad request
+
+  /videos/stats:
+    get:
+      operationId: getVideoStats
+      tags: [videos]
+      summary: Get recording stats
+      responses:
+        "200":
+          description: Stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VideoStats"
+
+  /videos/{id}:
+    get:
+      operationId: getVideo
+      tags: [videos]
+      summary: Get a single video's metadata
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: t
+          in: query
+          required: false
+          description: Share token; required for recordings that are not public
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Video metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Video"
+        "404":
+          description: Not found
+
+    patch:
+      operationId: updateVideo
+      tags: [videos]
+      summary: Update video metadata (e.g. rename)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VideoUpdate"
+      responses:
+        "200":
+          description: Updated video
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Video"
+        "404":
+          description: Not found
+
+    delete:
+      operationId: deleteVideo
+      tags: [videos]
+      summary: Delete a video
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Not found
+
+  /videos/{id}/share-token:
+    post:
+      operationId: rotateShareToken
+      tags: [videos]
+      summary: Issue a new share token, invalidating every link handed out so far
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Video with its new token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Video"
+        "404":
+          description: Not found
+
+  /videos/{id}/dropbox:
+    post:
+      operationId: pushVideoToDropbox
+      tags: [dropbox]
+      summary: Upload this recording's file to the configured Dropbox folder
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Video with Dropbox fields populated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Video"
+        "404":
+          description: Not found
+        "409":
+          description: Dropbox is not configured, or the upload failed
+
+    delete:
+      operationId: removeVideoFromDropbox
+      tags: [dropbox]
+      summary: Delete this recording's file from Dropbox and clear its link
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Video with Dropbox fields cleared
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Video"
+        "404":
+          description: Not found
+        "409":
+          description: Dropbox is not configured, or the delete failed
+
+  /dropbox/status:
+    get:
+      operationId: getDropboxStatus
+      tags: [dropbox]
+      summary: Whether Dropbox credentials are present and working
+      responses:
+        "200":
+          description: Connection status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DropboxStatus"
+
+  /dropbox/files:
+    get:
+      operationId: listDropboxFiles
+      tags: [dropbox]
+      summary: List every video in the configured Dropbox folder
+      responses:
+        "200":
+          description: Dropbox folder contents
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DropboxListing"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    Visibility:
+      type: string
+      enum: [private, unlisted, public]
+      description: >
+        private = token rotated on switch, so old links die;
+        unlisted = playable with the share token;
+        public = playable by anyone who knows the id.
+
+    Video:
+      type: object
+      required:
+        - id
+        - title
+        - filename
+        - mimeType
+        - size
+        - createdAt
+        - visibility
+        - shareToken
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        filename:
+          type: string
+        mimeType:
+          type: string
+        size:
+          type: integer
+          description: File size in bytes
+        duration:
+          type: ["number", "null"]
+          description: Duration in seconds
+        createdAt:
+          type: string
+          format: date-time
+        visibility:
+          $ref: "#/components/schemas/Visibility"
+        shareToken:
+          type: string
+          description: Required as ?t= to stream anything that is not public
+        dropboxPath:
+          type: ["string", "null"]
+          description: Path inside the configured Dropbox folder, once mirrored
+        dropboxSharedUrl:
+          type: ["string", "null"]
+          description: Dropbox shared link, present while visibility allows one
+        dropboxUploadedAt:
+          type: ["string", "null"]
+          format: date-time
+
+    VideoUpload:
+      type: object
+      properties:
+        title:
+          type: string
+
+    VideoUpdate:
+      type: object
+      properties:
+        title:
+          type: string
+          minLength: 1
+        visibility:
+          $ref: "#/components/schemas/Visibility"
+
+    DropboxStatus:
+      type: object
+      required:
+        - configured
+        - connected
+        - folder
+      properties:
+        configured:
+          type: boolean
+          description: Whether Dropbox credentials are present in the environment
+        connected:
+          type: boolean
+          description: Whether those credentials actually authenticate
+        folder:
+          type: string
+        accountEmail:
+          type: ["string", "null"]
+        error:
+          type: ["string", "null"]
+
+    DropboxFile:
+      type: object
+      required:
+        - id
+        - name
+        - path
+        - size
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        path:
+          type: string
+        size:
+          type: integer
+        clientModified:
+          type: ["string", "null"]
+          format: date-time
+        sharedUrl:
+          type: ["string", "null"]
+
+    DropboxListing:
+      type: object
+      required:
+        - files
+      properties:
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/DropboxFile"
+        error:
+          type: ["string", "null"]
+
+    VideoStats:
+      type: object
+      required:
+        - totalCount
+        - totalSizeBytes
+        - totalDurationSeconds
+      properties:
+        totalCount:
+          type: integer
+        totalSizeBytes:
+          type: integer
+        totalDurationSeconds:
+          type: number
